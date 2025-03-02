@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Celery Worker状态</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 20px;
+        }
+        h1 {
+            color: #333;
+        }
+        .worker-table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 20px;
+        }
+        .worker-table th, .worker-table td {
+            border: 1px solid #ddd;
+            padding: 8px;
+            text-align: left;
+        }
+        .worker-table th {
+            background-color: #f2f2f2;
+        }
+        .refresh-button {
+            padding: 10px 20px;
+            background-color: #4CAF50;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            margin-top: 20px;
+        }
+        .refresh-button:hover {
+            background-color: #45a049;
+        }
+        .error {
+            color: #721c24;
+            background-color: #f8d7da;
+            padding: 10px;
+            border-radius: 4px;
+        }
+    </style>
+</head>
+<body>
+    <h1>Celery Worker状态</h1>
+    
+    <div id="workerStatus">加载中...</div>
+    <button onclick="refreshWorkerStatus()" class="refresh-button">刷新状态</button>
+    
+    <script>
+        async function refreshWorkerStatus() {
+            try {
+                const response = await fetch('/worker-status');
+                const data = await response.json();
+                
+                if (data.workers.length === 0) {
+                    document.getElementById('workerStatus').innerHTML = 
+                        '<p>没有发现活动的Worker</p>';
+                    return;
+                }
+                
+                let html = '<table class="worker-table">';
+                html += '<tr><th>Worker名称</th><th>状态</th><th>活跃任务</th><th>已处理任务</th></tr>';
+                
+                for (const worker of data.workers) {
+                    html += `
+                        <tr>
+                            <td>${worker.name}</td>
+                            <td>${worker.status}</td>
+                            <td>${worker.active_tasks}</td>
+                            <td>${worker.processed}</td>
+                        </tr>
+                    `;
+                }
+                
+                html += '</table>';
+                document.getElementById('workerStatus').innerHTML = html;
+            } catch (error) {
+                console.error('获取Worker状态失败:', error);
+                document.getElementById('workerStatus').innerHTML = 
+                    '<p class="error">获取Worker状态失败: ' + error.message + '</p>';
+            }
+        }
+        
+        // 页面加载时获取一次状态
+        refreshWorkerStatus();
+        
+        // 每10秒自动刷新一次
+        setInterval(refreshWorkerStatus, 10000);
+    </script>
+</body>
+</html> 

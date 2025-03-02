@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>SSE测试</title>
+</head>
+<body>
+    <h1>SSE测试页面</h1>
+    <div id="messages"></div>
+
+    <script>
+        const messagesDiv = document.getElementById('messages');
+        
+        function addMessage(text) {
+            const p = document.createElement('p');
+            p.textContent = text;
+            messagesDiv.appendChild(p);
+        }
+
+        addMessage("开始连接SSE...");
+        const eventSource = new EventSource('/test-sse');
+        
+        eventSource.addEventListener('test', function(event) {
+            addMessage("收到测试消息: " + event.data);
+        });
+        
+        eventSource.onopen = function() {
+            addMessage("SSE连接已打开");
+        };
+        
+        eventSource.onerror = function(error) {
+            addMessage("SSE错误: " + JSON.stringify(error));
+        };
+        
+        eventSource.onmessage = function(event) {
+            addMessage("收到默认消息: " + event.data);
+        };
+    </script>
+</body>
+</html> 
