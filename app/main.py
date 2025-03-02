@@ -11,6 +11,7 @@ import json
 import redis
 from fastapi.responses import RedirectResponse
 import httpx
+import time
 
 app = FastAPI()
 
@@ -55,11 +56,15 @@ async def create_concurrent_tasks(num_tasks: int):
             id=task_id,
             name=f"AI任务-{i+1}",
             status=TaskStatus.PENDING,
-            result=None
+            result=None,
+            progress=0  # 确保设置初始进度
         )
         tasks[task_id] = task
         task_ids.append(task_id)
         print(f"创建任务: {task_id}")
+    
+    # 创建完所有任务后发布一次更新
+    publish_task_update()
     
     return {
         "message": f"已创建{num_tasks}个并发任务",
@@ -104,71 +109,68 @@ async def get_task_status(task_id: str):
     }
 
 @app.get("/tasks/stream")
-async def stream_tasks():
-    """SSE任务状态流"""
+async def task_stream(request: Request):
+    """任务状态流，使用SSE实时推送任务状态更新"""
+    print(f"新的SSE连接已建立，客户端IP: {request.client.host}")
+    
     async def event_generator():
-        # 发送初始连接成功消息
+        # 发送连接成功事件
         yield {
             "event": "connected",
             "data": json.dumps({"status": "connected"})
         }
         
+        # 持续发送任务更新
         while True:
+            if await request.is_disconnected():
+                print(f"客户端断开连接: {request.client.host}")
+                break
+            
             # 获取所有任务的最新状态
-            tasks_data = []
+            task_updates = []
             for task_id in list(tasks.keys()):
                 try:
+                    # 获取Celery任务
                     celery_task = celery_app.AsyncResult(task_id)
-                    current_state = celery_task.state
-                    
-                    # 添加调试日志
-                    print(f"SSE更新: 任务 {task_id} 状态={current_state}, 结果={celery_task.result}")
                     
                     # 更新任务状态
-                    if current_state == 'PENDING':
-                        tasks[task_id].status = TaskStatus.PENDING
-                    elif current_state == 'STARTED':
-                        tasks[task_id].status = TaskStatus.RUNNING
-                    elif current_state == 'SUCCESS':
-                        tasks[task_id].status = TaskStatus.COMPLETED
-                        result = celery_task.result
-                        if isinstance(result, dict):
-                            tasks[task_id].result = result.get('result', str(result))
-                        else:
-                            tasks[task_id].result = str(result)
-                    elif current_state == 'FAILURE':
-                        tasks[task_id].status = TaskStatus.FAILED
-                        tasks[task_id].result = str(celery_task.result)
-
-                    tasks_data.append({
-                        "id": tasks[task_id].id,
-                        "name": tasks[task_id].name,
-                        "status": tasks[task_id].status,
-                        "result": tasks[task_id].result,
-                        "celery_status": current_state
-                    })
+                    task = tasks[task_id]
+                    
+                    # 根据Celery任务状态更新本地任务状态
+                    if celery_task.state == 'PENDING':
+                        task.status = TaskStatus.PENDING
+                    elif celery_task.state == 'STARTED' or celery_task.state == 'PROGRESS':
+                        task.status = TaskStatus.RUNNING
+                        # 如果有进度信息，更新进度
+                        if celery_task.info and isinstance(celery_task.info, dict) and 'progress' in celery_task.info:
+                            task.progress = celery_task.info['progress']
+                    elif celery_task.state == 'SUCCESS':
+                        task.status = TaskStatus.SUCCESS
+                        task.progress = 100
+                        # 更新结果
+                        if celery_task.result and isinstance(celery_task.result, dict):
+                            task.result = celery_task.result.get('result', '任务完成')
+                    elif celery_task.state == 'FAILURE':
+                        task.status = TaskStatus.FAILED
+                        task.result = str(celery_task.result)
+                    
+                    # 添加到更新列表
+                    task_updates.append(task.dict())
                 except Exception as e:
-                    print(f"SSE处理任务出错 {task_id}: {e}")
-
-            # 确保数据格式正确
-            if tasks_data:  # 只有当有任务数据时才发送
-                print(f"发送SSE更新，任务数量: {len(tasks_data)}")
+                    print(f"处理任务 {task_id} 状态时出错: {e}")
+            
+            # 发送更新
+            if task_updates:
+                print(f"发送任务更新，共 {len(task_updates)} 个任务")
                 yield {
                     "event": "update",
-                    "data": json.dumps({"tasks": tasks_data})
+                    "data": json.dumps({"tasks": task_updates})
                 }
             
+            # 等待一段时间再发送下一次更新
             await asyncio.sleep(1)
-
-    return EventSourceResponse(
-        event_generator(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no"  # 禁用Nginx缓冲
-        }
-    )
+    
+    return EventSourceResponse(event_generator())
 
 @app.get("/test-sse")
 async def test_sse():
@@ -322,4 +324,189 @@ async def get_worker_status():
 @app.get("/flower-status")
 async def get_flower_status_page():
     """返回简单的Flower状态页面"""
-    return FileResponse("static/flower-status.html") 
+    return FileResponse("static/flower-status.html")
+
+# 修改publish_task_update函数
+def publish_task_update():
+    """发布任务更新到Redis"""
+    try:
+        # 获取所有任务
+        task_list = [task.dict() for task in tasks.values()]
+        data = json.dumps({"tasks": task_list})
+        
+        # 连接Redis并发布
+        redis_client = redis.Redis(host='127.0.0.1', port=6379, db=0)
+        result = redis_client.publish("task-updates", data)
+        print(f"任务更新已发布到Redis，接收者数量: {result}, 数据长度: {len(data)}")
+        
+        # 如果没有接收者，可能是SSE连接有问题
+        if result == 0:
+            print("警告: 没有接收者接收任务更新")
+        
+        return True
+    except Exception as e:
+        print(f"发布任务更新失败: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+# 修改任务状态更新的地方，确保调用publish_task_update
+@app.get("/tasks/{task_id}/status")
+async def get_task_status(task_id: str):
+    """获取单个任务的状态"""
+    if task_id not in tasks:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    
+    # 获取Celery任务
+    celery_task = celery_app.AsyncResult(task_id)
+    
+    # 更新任务状态
+    task = tasks[task_id]
+    old_status = task.status
+    
+    # 根据Celery任务状态更新本地任务状态
+    if celery_task.state == 'PENDING':
+        task.status = TaskStatus.PENDING
+    elif celery_task.state == 'STARTED' or celery_task.state == 'PROGRESS':
+        task.status = TaskStatus.RUNNING
+        # 如果有进度信息，更新进度
+        if celery_task.info and isinstance(celery_task.info, dict) and 'progress' in celery_task.info:
+            task.progress = celery_task.info['progress']
+    elif celery_task.state == 'SUCCESS':
+        task.status = TaskStatus.SUCCESS
+        task.progress = 100
+        # 更新结果
+        if celery_task.result and isinstance(celery_task.result, dict):
+            task.result = celery_task.result.get('result', '任务完成')
+    elif celery_task.state == 'FAILURE':
+        task.status = TaskStatus.FAILED
+        task.result = str(celery_task.result)
+    
+    # 如果状态有变化，发布更新
+    if old_status != task.status or task.progress != getattr(task, 'old_progress', None):
+        task.old_progress = task.progress  # 记录旧进度
+        print(f"任务 {task_id} 状态变化: {old_status} -> {task.status}, 进度: {task.progress}%")
+        publish_task_update()
+    
+    return task.dict()
+
+@app.post("/tasks/refresh")
+async def refresh_tasks():
+    """手动刷新所有任务状态并推送更新"""
+    updated_count = 0
+    
+    for task_id in list(tasks.keys()):
+        try:
+            # 获取Celery任务
+            celery_task = celery_app.AsyncResult(task_id)
+            
+            # 更新任务状态
+            task = tasks[task_id]
+            old_status = task.status
+            
+            # 根据Celery任务状态更新本地任务状态
+            if celery_task.state == 'PENDING':
+                task.status = TaskStatus.PENDING
+            elif celery_task.state == 'STARTED' or celery_task.state == 'PROGRESS':
+                task.status = TaskStatus.RUNNING
+                # 如果有进度信息，更新进度
+                if celery_task.info and isinstance(celery_task.info, dict) and 'progress' in celery_task.info:
+                    task.progress = celery_task.info['progress']
+            elif celery_task.state == 'SUCCESS':
+                task.status = TaskStatus.SUCCESS
+                task.progress = 100
+                # 更新结果
+                if celery_task.result and isinstance(celery_task.result, dict):
+                    task.result = celery_task.result.get('result', '任务完成')
+            elif celery_task.state == 'FAILURE':
+                task.status = TaskStatus.FAILED
+                task.result = str(celery_task.result)
+            
+            # 如果状态有变化，计数
+            if old_status != task.status:
+                updated_count += 1
+        except Exception as e:
+            print(f"刷新任务 {task_id} 状态失败: {e}")
+    
+    # 无论是否有更新，都发布一次
+    publish_task_update()
+    
+    return {"message": f"已刷新所有任务状态，{updated_count}个任务有状态变化"}
+
+# 添加一个后台任务来定期刷新任务状态
+@app.on_event("startup")
+async def setup_periodic_tasks():
+    """设置定期任务"""
+    asyncio.create_task(periodic_task_refresh())
+
+async def periodic_task_refresh():
+    """定期刷新任务状态"""
+    while True:
+        try:
+            # 每秒刷新一次任务状态
+            for task_id in list(tasks.keys()):
+                try:
+                    # 获取Celery任务
+                    celery_task = celery_app.AsyncResult(task_id)
+                    
+                    # 更新任务状态
+                    task = tasks[task_id]
+                    old_status = task.status
+                    old_progress = getattr(task, 'progress', 0)
+                    
+                    # 根据Celery任务状态更新本地任务状态
+                    if celery_task.state == 'PENDING':
+                        task.status = TaskStatus.PENDING
+                    elif celery_task.state == 'STARTED' or celery_task.state == 'PROGRESS':
+                        task.status = TaskStatus.RUNNING
+                        # 如果有进度信息，更新进度
+                        if celery_task.info and isinstance(celery_task.info, dict) and 'progress' in celery_task.info:
+                            task.progress = celery_task.info['progress']
+                    elif celery_task.state == 'SUCCESS':
+                        task.status = TaskStatus.SUCCESS
+                        task.progress = 100
+                        # 更新结果
+                        if celery_task.result and isinstance(celery_task.result, dict):
+                            task.result = celery_task.result.get('result', '任务完成')
+                    elif celery_task.state == 'FAILURE':
+                        task.status = TaskStatus.FAILED
+                        task.result = str(celery_task.result)
+                    
+                    # 如果状态或进度有变化，记录日志
+                    if old_status != task.status or old_progress != getattr(task, 'progress', 0):
+                        print(f"任务 {task_id} 状态变化: {old_status} -> {task.status}, 进度: {getattr(task, 'progress', 0)}%")
+                except Exception as e:
+                    print(f"刷新任务 {task_id} 状态失败: {e}")
+            
+            # 发布更新
+            if tasks:
+                publish_task_update()
+                
+        except Exception as e:
+            print(f"定期刷新任务出错: {e}")
+        
+        # 等待下一次刷新
+        await asyncio.sleep(1) 
+
+@app.get("/test-redis")
+async def test_redis():
+    """测试Redis发布/订阅功能"""
+    try:
+        # 连接Redis
+        redis_client = redis.Redis(host='127.0.0.1', port=6379, db=0)
+        
+        # 发布测试消息
+        test_data = json.dumps({"test": "message", "timestamp": time.time()})
+        result = redis_client.publish("test-channel", test_data)
+        
+        return {
+            "status": "success",
+            "receivers": result,
+            "message": "测试消息已发布到Redis"
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "error": str(e),
+            "message": "Redis测试失败"
+        } 

@@ -12,4 +12,5 @@ class Task(BaseModel):
     id: str
     name: str
     status: TaskStatus
-    result: Optional[str] = None 
+    result: Optional[str] = None
+    progress: int = 0  # 添加进度字段，默认为0 

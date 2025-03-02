@@ -100,11 +100,6 @@ def main():
         
         processes['fastapi'] = start_fastapi()
 
-        # 设置日志记录
-        for name, process in processes.items():
-            if process:
-                setup_debug_logging(process, name)
-
         print("\n所有服务已启动。访问 http://localhost:8000 查看任务监控界面")
         print("按 Ctrl+C 停止所有服务\n")
 

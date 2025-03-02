@@ -25,13 +25,18 @@ def execute_task(self, task_data):
         # 模拟HTTP请求延迟
         process_time = randint(3, 8)
         
-        # 模拟HTTP请求
+        # 模拟HTTP请求，分段更新进度
         with httpx.Client(timeout=30.0) as client:
-            # 不再检查是否被撤销，简化逻辑
-            
-            # 模拟处理
-            time.sleep(process_time)
-            self.update_state(state='PROGRESS', meta={'progress': 50})
+            # 分10段执行，每段更新一次进度
+            segments = 10
+            for i in range(segments):
+                # 执行一小段工作
+                time.sleep(process_time / segments)
+                
+                # 更新进度
+                progress = int((i + 1) / segments * 100)
+                print(f"任务 {task_id} 进度更新: {progress}%")
+                self.update_state(state='PROGRESS', meta={'progress': progress})
             
             # 模拟任务结果
             result = f"AI处理完成，API调用耗时{process_time}秒，任务ID: {task_id}"
